@@ -1,0 +1,187 @@
+import sys
+import os
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+sys.path.append(project_root)
+
+from config_ini import get_args_parser
+from datetime import datetime
+import os
+import torch
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from timm.data.mixup import Mixup
+from models.final.model_w_router import MatVisionTransformer, ModifiedBlock
+from utils.set_wandb import set_wandb
+import wandb
+from torch.utils.data.distributed import DistributedSampler
+from utils.dataloader import build_dataset
+from utils.lr_sched import adjust_learning_rate
+from utils.eval_flag import eval_mat_combined_dis, eval_router_dis
+import random
+from utils.initial import init, init_v2
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+import torch.nn.functional as F
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1, 3, 6, 7"
+
+flags_list = ['0.2', '0.4', '0.6', '0.8', '1.0']
+
+latency_list = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+def train(args):
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device('cuda', local_rank)
+
+    torch.distributed.init_process_group(backend='nccl')
+
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    model = MatVisionTransformer(embed_dim=args.initial_embed_dim, depth=args.initial_depth,
+                                 num_heads=args.initial_embed_dim // 64, num_classes=args.nb_classes,
+                                 drop_path_rate=args.drop_path, mlp_ratio=args.mlp_ratio, qkv_bias=True, block=ModifiedBlock)
+
+    model.to(device)
+
+    if args.pretrained:
+        check_point_path = '/home/nus-zwb/reuse/code/pretrained_para/vit_rearrange_v4.pth'
+        checkpoint = torch.load(check_point_path, map_location=device)
+        model.load_state_dict(checkpoint, strict=False)
+        model.eval()
+
+    if torch.cuda.device_count() > 1:
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        model = torch.nn.parallel.DistributedDataParallel(model,
+                                                          device_ids=[local_rank],
+                                                          output_device=local_rank, find_unused_parameters=True)
+
+    mixup_fn = None
+    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    if mixup_active:
+        print("Mixup is activated!")
+        mixup_fn = Mixup(
+            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+            label_smoothing=args.smoothing, num_classes=args.nb_classes)
+
+    if mixup_fn is not None:
+        criterion = SoftTargetCrossEntropy()
+    elif args.smoothing > 0.:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
+
+    train_dataset = build_dataset(is_train=True, args=args)
+    val_dataset = build_dataset(is_train=False, args=args)
+
+    trainDataLoader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, sampler=DistributedSampler(train_dataset))
+    valDataLoader = DataLoader(dataset=val_dataset, batch_size=args.batch_size, sampler=DistributedSampler(val_dataset))
+
+    param_groups = [
+        {'params': [p for n, p in model.named_parameters() if "router" not in n], 'lr':args.lr},
+        {'params': [p for n, p in model.named_parameters() if "router" in n], 'lr':1e-3, 'lr_scale':1e3},
+    ]
+    optimizer = torch.optim.AdamW(param_groups)
+
+
+    if torch.distributed.get_rank() == 0:
+        folder_path = 'logs_weight/'+args.model+args.dataset+str(args.lr)
+
+        os.makedirs(folder_path, exist_ok=True)
+        time = datetime.now().strftime('%b%d_%H-%M-%S')
+        log_dir = os.path.join(folder_path, time)
+        os.makedirs(log_dir)
+
+        weight_path = os.path.join(log_dir, 'weight')
+        os.makedirs(weight_path)
+
+        set_wandb(args, name='EAVit_imagenet')
+
+    for epoch in range(args.epochs):
+
+        with tqdm(total=len(trainDataLoader), postfix=dict, mininterval=0.3) as pbar:
+            pbar.set_description(f'train Epoch {epoch + 1}/{args.epochs}')
+
+            adjust_learning_rate(optimizer, epoch+1, args)
+
+            if torch.distributed.get_rank() == 0:
+                wandb.log({"Epoch": epoch + 1, "learning_rate" + str(local_rank): optimizer.param_groups[0]['lr']})
+
+            model.train()
+
+            total_loss = 0
+            total_ce_loss = 0
+            total_latency_loss = 0
+
+            for batch_idx, (img, label) in enumerate(trainDataLoader):
+
+                img = img.to(device)
+                label = label.to(device)
+
+                if mixup_fn is not None:
+                    img, label = mixup_fn(img, label)
+
+                optimizer.zero_grad()
+
+                latency = (torch.rand(1) * 0.9 + 0.2).to(device)
+
+                model.module.configure_latency(latency=latency, tau=1)
+
+                preds, attn_mask, mlp_mask, embed_mask, depth_attn_mask, depth_mlp_mask, total_macs = model(img)
+                total_macs = total_macs.unsqueeze(0)
+
+                ce_loss = criterion(preds, label)
+
+                latency_loss = F.mse_loss(total_macs, latency)
+
+                loss = ce_loss + latency_loss * 20
+
+                if torch.distributed.get_rank() == 0:
+                    if batch_idx % 10 == 0:
+                        wandb.log({"train_batch_loss/batch cross entropy loss": ce_loss})
+                        wandb.log({"train_batch_loss/batch latency loss": latency_loss})
+                        wandb.log({"train_batch_loss/train Batch Loss": loss.item()})
+
+                total_loss += loss.item()
+                total_ce_loss += ce_loss.item()
+                total_latency_loss += latency_loss.item()
+
+                loss.backward()
+                optimizer.step()
+
+                pbar.set_postfix(**{"loss": loss.item(), "lr": optimizer.param_groups[0]['lr']})
+                pbar.update(1)
+
+            epoch_loss = total_loss / len(trainDataLoader)
+            epoch_ce_loss = total_ce_loss / len(trainDataLoader)
+            epoch_latency_loss = total_latency_loss / len(trainDataLoader)
+
+            if torch.distributed.get_rank() == 0:
+                wandb.log({"Epoch": epoch + 1, "train_epoch_loss/Train epoch Loss": epoch_loss})
+                wandb.log({"Epoch": epoch + 1, "train_epoch_loss/Train epoch cross entropy loss": epoch_ce_loss})
+                wandb.log({"Epoch": epoch + 1, "train_epoch_loss/Train epoch latency loss": epoch_latency_loss})
+
+            pbar.close()
+
+        if (epoch+1) % 5 == 0:
+            for index, f in enumerate(flags_list):
+                latency = torch.tensor(latency_list[index]).to(device).unsqueeze(0)
+                model.module.configure_latency(latency=latency, tau=1)
+
+                eval_router_dis(model, valDataLoader, criterion, epoch, optimizer, args, flag=f, device=device, local_rank=local_rank)
+
+        if torch.distributed.get_rank() == 0:
+            torch.save(model.state_dict(), weight_path+'/stage2.pth')
+
+if __name__ == '__main__':
+    args = get_args_parser()
+    train(args)
+
+
+
+
